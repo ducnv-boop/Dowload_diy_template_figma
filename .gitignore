@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+name_control.json

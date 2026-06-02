@@ -19,6 +19,7 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = ROOT / "output"
+CONTROL_OUTPUT_DIR = ROOT / "output_control"
 TEMPLATE_PREFIX = "Template_"
 INVALID_FS_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -308,6 +309,208 @@ def load_rotated_manifest(folder: Path) -> dict[str, float]:
 
 def save_rotated_manifest(folder: Path, manifest: dict[str, float]) -> None:
     (folder / ROTATED_MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True))
+
+
+def iter_numeric_frames(node):
+    """Yield FRAME nodes whose name is a pure decimal integer (e.g. "91")."""
+    name = node.get("name") or ""
+    if node.get("type") == "FRAME" and name.isdigit():
+        yield node
+        return
+    for child in node.get("children") or []:
+        yield from iter_numeric_frames(child)
+
+
+def find_descendant_by_name(node, target_name: str):
+    """Depth-first search for a descendant whose `name` equals `target_name`.
+
+    Skips the root itself; only descendants are searched (so callers can
+    safely look up "wifi" inside a parent named "wifi" without hitting the
+    parent first).
+    """
+    for child in node.get("children") or []:
+        if child.get("name") == target_name:
+            return child
+        result = find_descendant_by_name(child, target_name)
+        if result is not None:
+            return result
+    return None
+
+
+def load_control_items(path: Path) -> list[tuple[str, list[str] | None]]:
+    """Parse name_control.json into [(item_name, subitems_or_None), ...].
+
+    Accepts a top-level list, or a dict with an `items` key. Each entry is
+    either a string (leaf item) or an object whose name key is any of
+    `item` / `name` / `layer` and whose optional subitems key is any of
+    `subItems` / `subitems` / `children`.
+    """
+    raw = json.loads(path.read_text())
+    if isinstance(raw, dict):
+        raw = raw.get("items", [])
+    if not isinstance(raw, list):
+        return []
+    result: list[tuple[str, list[str] | None]] = []
+    for entry in raw:
+        if isinstance(entry, str):
+            if entry:
+                result.append((entry, None))
+        elif isinstance(entry, dict):
+            name = entry.get("item") or entry.get("name") or entry.get("layer")
+            if not isinstance(name, str) or not name:
+                continue
+            subs_raw = (
+                entry.get("subItems")
+                or entry.get("subitems")
+                or entry.get("children")
+            )
+            if isinstance(subs_raw, list):
+                subs = [s for s in subs_raw if isinstance(s, str) and s]
+                result.append((name, subs or None))
+            else:
+                result.append((name, None))
+    return result
+
+
+def download_control_items(args, api, file_key, headers) -> int:
+    """Render listed items from numeric-named frames into output/<frame>/.
+
+    Item list comes from `name_control.json` at the repo root. For each
+    matched frame, every leaf item is rendered as `<item>.png` and every
+    subitem of a grouped item is rendered as `<subitem>.png`. Uses the same
+    batching, rate-limit retry, and chunked-render machinery as the main
+    download path.
+    """
+    config_path = ROOT / "name_control.json"
+    if not config_path.exists():
+        print(f"Missing config: {config_path}", file=sys.stderr)
+        return 1
+    try:
+        items = load_control_items(config_path)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"Failed to read {config_path.name}: {exc}", file=sys.stderr)
+        return 1
+    if not items:
+        print(f"{config_path.name} has no items.", file=sys.stderr)
+        return 1
+
+    print(f"Fetching file tree {file_key}...")
+    file_resp = get_with_retry(f"{api}/files/{file_key}", headers, timeout=120)
+    file_resp.raise_for_status()
+    document = file_resp.json()["document"]
+
+    pages = document.get("children", [])
+    if args.page:
+        wanted = set(args.page)
+        pages = [p for p in pages if p.get("name") in wanted]
+        missing = wanted - {p.get("name") for p in pages}
+        if missing:
+            print(f"Page(s) not found: {sorted(missing)}", file=sys.stderr)
+            return 1
+        print(f"Filtering to pages: {[p['name'] for p in pages]}")
+
+    wanted_ids = set(args.template) if args.template else None
+    seen_frames: set[str] = set()
+    # frame_name -> [(node_id, save_name), ...]
+    frame_entries: dict[str, list[tuple[str, str]]] = {}
+    frames_in_order: list[str] = []
+    missing_items_total = 0
+
+    for page in pages:
+        for frame in iter_numeric_frames(page):
+            frame_name = frame["name"]
+            if wanted_ids is not None and frame_name not in wanted_ids:
+                continue
+            if frame_name in seen_frames:
+                continue
+            seen_frames.add(frame_name)
+
+            entries: list[tuple[str, str]] = []
+            for item_name, subitems in items:
+                if subitems:
+                    group = find_descendant_by_name(frame, item_name)
+                    if group is None:
+                        print(f"  ?? {frame_name}: group '{item_name}' not found")
+                        missing_items_total += 1
+                        continue
+                    for sub_name in subitems:
+                        sub_node = find_descendant_by_name(group, sub_name)
+                        if sub_node is None:
+                            print(f"  ?? {frame_name}: subitem '{sub_name}' not in '{item_name}'")
+                            missing_items_total += 1
+                            continue
+                        entries.append((sub_node["id"], sub_name))
+                else:
+                    node = find_descendant_by_name(frame, item_name)
+                    if node is None:
+                        print(f"  ?? {frame_name}: item '{item_name}' not found")
+                        missing_items_total += 1
+                        continue
+                    entries.append((node["id"], item_name))
+
+            if entries:
+                frame_entries[frame_name] = entries
+                frames_in_order.append(frame_name)
+
+    if wanted_ids is not None:
+        missing_ids = wanted_ids - seen_frames
+        if missing_ids:
+            print(f"Frame(s) not found: {sorted(missing_ids)}", file=sys.stderr)
+            return 1
+
+    if not frames_in_order:
+        print("No numeric-named frames with any matching items found.")
+        return 0
+
+    CONTROL_OUTPUT_DIR.mkdir(exist_ok=True)
+    total_images = 0
+    total_failed = 0
+    total_batches = (len(frames_in_order) + TEMPLATE_BATCH_SIZE - 1) // TEMPLATE_BATCH_SIZE
+    prev_batch_hit_api = False
+
+    for batch_idx, batch in enumerate(chunked(frames_in_order, TEMPLATE_BATCH_SIZE)):
+        if prev_batch_hit_api:
+            print(f"\n--- pausing {BATCH_PAUSE_SECONDS}s before next batch ---")
+            time.sleep(BATCH_PAUSE_SECONDS)
+        prev_batch_hit_api = True
+
+        print(f"\n=== batch {batch_idx + 1}/{total_batches}: {len(batch)} frame(s) ===")
+
+        node_ids: list[str] = []
+        for frame_name in batch:
+            for node_id, _ in frame_entries[frame_name]:
+                node_ids.append(node_id)
+        if not node_ids:
+            continue
+
+        print(f"  rendering {len(node_ids)} node(s) as png@1x")
+        urls = fetch_render_urls(api, file_key, headers, node_ids, "png", 1)
+
+        for frame_name in batch:
+            folder = CONTROL_OUTPUT_DIR / frame_name
+            folder.mkdir(parents=True, exist_ok=True)
+            entries = frame_entries[frame_name]
+            print(f"\n  {frame_name} ({len(entries)} item(s))")
+            for node_id, save_name in entries:
+                url = urls.get(node_id)
+                if not url:
+                    print(f"    skip {save_name}: Figma returned no URL")
+                    total_failed += 1
+                    continue
+                try:
+                    saved = download_image(url, folder, safe_name(save_name), ".png")
+                    print(f"    saved {saved.name}")
+                    total_images += 1
+                except requests.HTTPError as exc:
+                    print(f"    fail {save_name}: {exc}")
+                    total_failed += 1
+
+    print(
+        f"\nDone. {len(frames_in_order)} frame(s) processed, "
+        f"{total_images} images saved, {total_failed} failed, "
+        f"{missing_items_total} item/subitem lookups missing."
+    )
+    return 0
 
 
 def post_process_resize(args) -> int:
@@ -622,6 +825,17 @@ def main() -> int:
             "file's own aspect ratio. Re-encodes via PIL."
         ),
     )
+    parser.add_argument(
+        "--control",
+        action="store_true",
+        help=(
+            "Download control-center items: for every FRAME whose name is "
+            "purely a number, render each item listed in name_control.json. "
+            "Items can be plain strings (one layer) or objects with "
+            "`subItems` (find the group layer, then render each subitem "
+            "individually). Saves to output_control/<frame-name>/<item-or-subitem>.png."
+        ),
+    )
     args = parser.parse_args()
 
     if args.fix_ext:
@@ -642,6 +856,9 @@ def main() -> int:
 
     headers = {"X-Figma-Token": token}
     api = "https://api.figma.com/v1"
+
+    if args.control:
+        return download_control_items(args, api, file_key, headers)
 
     print(f"Fetching file tree {file_key}...")
     file_resp = get_with_retry(f"{api}/files/{file_key}", headers, timeout=120)
